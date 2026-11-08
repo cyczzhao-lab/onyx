@@ -218,6 +218,57 @@ def changed_writes(
     }
 
 
+def commit_limit_error(
+    current: StoreSnapshot, writes: Mapping[str, JsonValue]
+) -> str | None:
+    """Why `writes` cannot commit onto `current`, or None if they can.
+
+    store() checks the limits against the store a program started with; this
+    checks them again against commits that other programs made meanwhile.
+    """
+    before = sum(entry_bytes(key, value) for key, value in current.values.items())
+    after = (
+        before
+        - sum(
+            entry_bytes(key, current.values[key])
+            for key in writes
+            if key in current.values
+        )
+        + sum(
+            entry_bytes(key, value)
+            for key, value in writes.items()
+            if value is not None
+        )
+    )
+    if after > MAX_STORE_BYTES and after > before:
+        return (
+            f"the store would hold {after} bytes with the writes of other "
+            f"programs; the limit is {MAX_STORE_BYTES} bytes"
+        )
+    committed = current.committed_bytes + sum(
+        entry_bytes(key, value) for key, value in writes.items()
+    )
+    stores_values = any(value is not None for value in writes.values())
+    if stores_values and committed > MAX_COMMITTED_BYTES:
+        return (
+            f"this chat would save {committed} bytes of store writes with the "
+            f"writes of other programs; the limit is {MAX_COMMITTED_BYTES} bytes "
+            "per chat"
+        )
+    return None
+
+
+def store_summary(writes: Mapping[str, JsonValue]) -> str | None:
+    """One line on a commit's writes, so the model knows the keys."""
+    stored = [key for key, value in writes.items() if value is not None]
+    deleted = [key for key, value in writes.items() if value is None]
+    parts = [
+        *([f"Stored: {', '.join(stored)}."] if stored else []),
+        *([f"Deleted from the store: {', '.join(deleted)}."] if deleted else []),
+    ]
+    return " ".join(parts) or None
+
+
 def _valid_key(key: object) -> str:
     if not isinstance(key, str):
         raise TypeError(f"Store keys must be str, not {type(key).__name__}.")
@@ -251,6 +302,11 @@ class ProgramStore:
         """The last value written to each key, None deleting it; also writes that
         do not change the store."""
         return dict(self._writes)
+
+    @property
+    def changed_writes(self) -> dict[str, JsonValue]:
+        """The writes that change the store this program started with."""
+        return changed_writes(self._snapshot.values, self._writes)
 
     @property
     def functions(self) -> dict[str, Callable[..., JsonValue]]:
